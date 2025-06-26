@@ -2,3 +2,9 @@
 output
 /BoostingMonocularDepth/pix2pix/checkpoints/mergemodel/res101.pth
 /BoostingMonocularDepth/pix2pix/checkpoints/mergemodel/latest_net_G.pth
+# Ignore Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+**/*.egg-info/

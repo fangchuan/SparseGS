@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import math
 import cv2
 import diptest
-from icecream import ic
+
 from guidance.sd_utils import StableDiffusion
 from random import randint
 from utils.loss_utils import l1_loss, ssim, local_pearson_loss, pearson_depth_loss, mask_l1_loss
@@ -439,7 +439,7 @@ if __name__ == "__main__":
     parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
-    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
+    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[7000, 15000, 30000])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--step", type=int, default=1)
     parser.add_argument("--max_cameras", type=int, default=None)

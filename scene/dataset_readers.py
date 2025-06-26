@@ -327,7 +327,132 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
                            ply_path=ply_path)
     return scene_info
 
+from typing import Dict, Any
+def readSpatialgenCameras(data_dict: Dict[str, Any], load_depth: bool = True):
+    # load rgbs, depths, poses
+    input_rgbs, input_depths, input_poses, target_rgbs, target_depths, target_poses, intrinsic_np = \
+        data_dict["input_rgbs"], data_dict["input_depths"], data_dict["input_poses"], \
+        data_dict["target_rgbs"], data_dict["target_depths"], data_dict["target_poses"], \
+        data_dict["intrinsic"]
+        
+    num_cams = len(input_rgbs) + len(target_rgbs)
+
+    cam_infos = []
+    holdout_infos = []
+    # print(subkeys)    
+        
+    # take the first num_init_views as RGBD frames
+    uid = 0
+    for idx, (input_rgb, input_depth, input_pose) in enumerate(zip(input_rgbs, input_depths, input_poses)):
+        image = Image.fromarray(input_rgb.astype(np.uint8))
+        
+        c2w_pose = input_pose
+        w2c_pose = np.linalg.inv(c2w_pose)
+
+        height = input_rgb.shape[0]
+        width = input_rgb.shape[1]
+
+        # c2w rotation
+        R = c2w_pose[:3, :3]
+        # w2c trans
+        T = w2c_pose[:3, 3]
+
+        focal_length_x = intrinsic_np[0, 0]
+        FovY = focal2fov(focal_length_x, height)
+        FovX = focal2fov(focal_length_x, width)
+
+        image_name = f"input_{idx}"
+
+        depth = None
+        if load_depth:
+            depth = input_depth
+
+        uid = idx
+        cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image, depth=depth,
+                              image_path=f'input_rgb_{idx}', image_name=image_name, width=width, height=height)
+        cam_infos.append(cam_info)
+    
+    for idx, (tar_rgb, tar_depth, tar_pose) in enumerate(zip(target_rgbs, target_depths, target_poses)):
+        image = Image.fromarray(tar_rgb.astype(np.uint8))
+        
+        c2w_pose = tar_pose
+        w2c_pose = np.linalg.inv(c2w_pose)
+
+        height = tar_rgb.shape[0]
+        width = tar_rgb.shape[1]
+
+        # c2w rotation
+        R = c2w_pose[:3, :3]
+        # w2c trans
+        T = w2c_pose[:3, 3]
+
+        focal_length_x = intrinsic_np[0, 0]
+        FovY = focal2fov(focal_length_x, height)
+        FovX = focal2fov(focal_length_x, width)
+
+        image_name = f"target_{idx}"
+
+        depth = None
+        if load_depth:
+            depth = tar_depth
+
+        uid += 1
+        cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image, depth=depth,
+                              image_path=f'target_rgb_{uid}', image_name=image_name, width=width, height=height)
+        cam_infos.append(cam_info)
+    
+    return cam_infos
+
+# def readSpatialGenSceneInfo(path, images, eval, llffhold=8, step=1, max_cameras=None, load_depth=True):
+def readSpatialGenSceneInfo(path, eval, load_depth=True):
+    try:
+        scene_info_npzfile = os.path.join(path, "inference_results.npz")
+        rooms_infer_res_dict = np.load(scene_info_npzfile, allow_pickle=True)
+        room_uid = list(rooms_infer_res_dict.keys())[0]
+        room_infer_results = rooms_infer_res_dict[room_uid][()]
+        
+    except Exception as e:
+        print(e)
+        sys.exit(-1)
+        
+    cam_infos_unsorted = readSpatialgenCameras(data_dict=room_infer_results, load_depth=load_depth)
+    cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
+    # holdout_infos = sorted(holdout_infos_unsorted.copy(), key = lambda x : x.image_name)
+
+    if eval:
+        train_cam_infos = [c for idx, c in enumerate(cam_infos)]
+        test_cam_infos = [c for idx, c in enumerate(cam_infos)]
+    else:
+        train_cam_infos = cam_infos
+        test_cam_infos = []
+
+    nerf_normalization = getNerfppNorm(train_cam_infos)
+
+    ply_path = os.path.join(path, "gs_ply.ply")
+    o3d_ply_path = os.path.join(path, "global_scene_ply.ply")
+    if not os.path.exists(ply_path):
+        print("Converting point cloud from open3d to plydata, will happen only the first time you open the scene.")
+        import open3d as o3d
+        o3d_ply = o3d.io.read_point_cloud(o3d_ply_path)
+        xyz = np.array(o3d_ply.points)
+        rgb = np.array(o3d_ply.colors)
+        print(f"xyz shape: {xyz.shape}, rgb shape: {rgb.shape}")
+        storePly(ply_path, xyz, rgb)
+    try:
+        pcd = fetchPly(ply_path)
+    except:
+        pcd = None
+
+    scene_info = SceneInfo(point_cloud=pcd,
+                           train_cameras=train_cam_infos,
+                           test_cameras=test_cam_infos,
+                           hold_cameras=[],
+                           nerf_normalization=nerf_normalization,
+                           ply_path=ply_path)
+    return scene_info
+
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,
-    "Blender" : readNerfSyntheticInfo
+    "Blender" : readNerfSyntheticInfo,
+    "Spatialgen": readSpatialGenSceneInfo,
 }

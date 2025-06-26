@@ -25,3 +25,5 @@ dependencies:
     - plyfile
     - recordclass
     - scikit-image
+    - imageio
+    - imageio-ffmpeg
