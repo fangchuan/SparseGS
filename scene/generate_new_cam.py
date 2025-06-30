@@ -139,7 +139,7 @@ def create_cam_obj(cam, degree, R, T, scaling_factor,cam_focal_dict):
     [0, cam_focal_dict[cam.uid][1]/scaling_factor, (src_img.shape[1]-1) / 2],
     [0, 0, 1.0]
     ])).to('cuda')
-    uid = cam.uid + 0.01*degree
+    uid = cam.uid + round(0.01*degree, 2)
 
     return Camera(colmap_id= None, R=R, T=T, FoVx = cam.FoVx, FoVy = cam.FoVy,  
         image=src_img, depth=scaled_depth, K = K, src_R = src_R, src_T = src_T, src_uid = cam.uid,

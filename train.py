@@ -15,6 +15,7 @@ import matplotlib.pyplot as plt
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
+from scene.cameras import Camera
 from utils.general_utils import safe_state, normalize
 import time
 import uuid
@@ -39,7 +40,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
-    scene = Scene(dataset, gaussians, step=step, max_cameras=max_cameras)
+    scene =  Scene(dataset, gaussians, step=step, max_cameras=max_cameras)
     gaussians.training_setup(opt)
     
 
@@ -120,12 +121,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if pick_warp_cam: # A warping cam is picked
             if not warp_cam_stack:
                 warp_cam_stack = scene.getFtCameras().copy()
-            warp_cam = warp_cam_stack.pop(randint(0, len(warp_cam_stack)-1))
+            warp_cam: Camera = warp_cam_stack.pop(randint(0, len(warp_cam_stack)-1))
             warp_render_pkg = render(warp_cam, gaussians, pipe, background)
             warp_image, warp_viewspace_point_tensor, warp_visibility_filter, warp_radii = warp_render_pkg["render"], warp_render_pkg["viewspace_points"], warp_render_pkg["visibility_filter"], warp_render_pkg["radii"]
             reg_gt_image = warp_cam.original_image.cuda()
             reg_mask = warp_cam.warp_mask
-
 
 
         # Render
@@ -139,6 +139,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Loss
         Ll1 = l1_loss(image, gt_image)
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+        # # compute lpips loss and weigth
+        # from lpipsPyTorch import lpips
+        # lambda_lpips = 0.25
+        # lpiploss = lpips(image.float(), gt_image.float(), net_type='vgg')
+        # loss = (1.0 - opt.lambda_dssim - lambda_lpips) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image)) + lambda_lpips * lpiploss
 
        
         diffusion_loss = None

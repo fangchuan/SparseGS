@@ -12,7 +12,7 @@
 import os
 import sys
 from PIL import Image
-from typing import NamedTuple
+from typing import NamedTuple, List
 from scene.colmap_loader import read_extrinsics_text, read_intrinsics_text, qvec2rotmat, \
     read_extrinsics_binary, read_intrinsics_binary, read_points3D_binary, read_points3D_text
 from utils.graphics_utils import getWorld2View2, focal2fov, fov2focal
@@ -37,7 +37,22 @@ class CameraInfo(NamedTuple):
     image_path: str
     image_name: str
     width: int
+    height: int    
+class SpatialGenCameraInfo(NamedTuple):
+    uid: int
+    R: np.array
+    T: np.array
+    FovY: np.array
+    FovX: np.array
+    image: np.array
+    depth: np.array
+    image_path: str
+    image_name: str
+    width: int
     height: int
+    points: np.array
+    colors: np.array
+    scales: np.array
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -179,20 +194,25 @@ def fetchPly(path):
     plydata = PlyData.read(path)
     vertices = plydata['vertex']
     positions = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
-    colors = np.vstack([vertices['red'], vertices['green'], vertices['blue']]).T / 255.0
+    # colors = np.vstack([vertices['red'], vertices['green'], vertices['blue']]).T / 255.0
+    colors = np.vstack([vertices['red'], vertices['green'], vertices['blue']]).T
     normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
-    return BasicPointCloud(points=positions, colors=colors, normals=normals)
+    scales = np.vstack([vertices['sx'], vertices['sy'], vertices['sz']]).T
+    return BasicPointCloud(points=positions, colors=colors, normals=normals, scales=scales)
 
-def storePly(path, xyz, rgb):
+def storePly(path, xyz, rgb, scales=None):
     # Define the dtype for the structured array
     dtype = [('x', 'f4'), ('y', 'f4'), ('z', 'f4'),
             ('nx', 'f4'), ('ny', 'f4'), ('nz', 'f4'),
-            ('red', 'u1'), ('green', 'u1'), ('blue', 'u1')]
+            ('red', 'u1'), ('green', 'u1'), ('blue', 'u1'),
+            ('sx', 'f4'), ('sy', 'f4'), ('sz', 'f4')]
     
     normals = np.zeros_like(xyz)
+    if scales is None:
+        scales = np.zeros_like(xyz)
 
     elements = np.empty(xyz.shape[0], dtype=dtype)
-    attributes = np.concatenate((xyz, normals, rgb), axis=1)
+    attributes = np.concatenate((xyz, normals, rgb, scales), axis=1)
     elements[:] = list(map(tuple, attributes))
 
     # Create the PlyData object and write to file
@@ -328,12 +348,15 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
     return scene_info
 
 from typing import Dict, Any
-def readSpatialgenCameras(data_dict: Dict[str, Any], load_depth: bool = True):
+def readSpatialgenCameras(data_dict: Dict[str, Any], load_depth: bool = True) -> List[SpatialGenCameraInfo]:
     # load rgbs, depths, poses
     input_rgbs, input_depths, input_poses, target_rgbs, target_depths, target_poses, intrinsic_np = \
         data_dict["input_rgbs"], data_dict["input_depths"], data_dict["input_poses"], \
         data_dict["target_rgbs"], data_dict["target_depths"], data_dict["target_poses"], \
         data_dict["intrinsic"]
+    
+    input_points, input_colors = data_dict["input_points"], data_dict["input_colors"]
+    target_points, target_colors = data_dict["target_points"], data_dict["target_colors"]
         
     num_cams = len(input_rgbs) + len(target_rgbs)
 
@@ -343,7 +366,7 @@ def readSpatialgenCameras(data_dict: Dict[str, Any], load_depth: bool = True):
         
     # take the first num_init_views as RGBD frames
     uid = 0
-    for idx, (input_rgb, input_depth, input_pose) in enumerate(zip(input_rgbs, input_depths, input_poses)):
+    for idx, (input_rgb, input_depth, input_pose, input_point, input_color) in enumerate(zip(input_rgbs, input_depths, input_poses, input_points, input_colors)):
         image = Image.fromarray(input_rgb.astype(np.uint8))
         
         c2w_pose = input_pose
@@ -363,16 +386,19 @@ def readSpatialgenCameras(data_dict: Dict[str, Any], load_depth: bool = True):
 
         image_name = f"input_{idx}"
 
-        depth = None
-        if load_depth:
-            depth = input_depth
+        depth = input_depth
+        init_scales = depth / focal_length_x / np.sqrt(2)
+        init_scales = init_scales[:, :, None].repeat(3, axis=-1)
+        scales = init_scales.reshape(-1, 3)
+        # print(f"scales shape: {scales.shape}, points shape: {input_point.shape}, colors shape: {input_color.shape}")
 
         uid = idx
-        cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image, depth=depth,
-                              image_path=f'input_rgb_{idx}', image_name=image_name, width=width, height=height)
+        cam_info = SpatialGenCameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image, depth=depth,
+                              image_path=f'input_rgb_{idx}', image_name=image_name, width=width, height=height,
+                              points=input_point, colors=input_color, scales=scales)
         cam_infos.append(cam_info)
     
-    for idx, (tar_rgb, tar_depth, tar_pose) in enumerate(zip(target_rgbs, target_depths, target_poses)):
+    for idx, (tar_rgb, tar_depth, tar_pose, tar_point, tar_color) in enumerate(zip(target_rgbs, target_depths, target_poses, target_points, target_colors)):
         image = Image.fromarray(tar_rgb.astype(np.uint8))
         
         c2w_pose = tar_pose
@@ -392,13 +418,16 @@ def readSpatialgenCameras(data_dict: Dict[str, Any], load_depth: bool = True):
 
         image_name = f"target_{idx}"
 
-        depth = None
-        if load_depth:
-            depth = tar_depth
+        depth = tar_depth
+        init_scales = depth / focal_length_x / np.sqrt(2)
+        init_scales = init_scales[:, :, None].repeat(3, axis=-1)
+        scales = init_scales.reshape(-1, 3)
+        # print(f"scales shape: {scales.shape}, points shape: {tar_point.shape}, colors shape: {tar_color.shape}") 
 
         uid += 1
-        cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image, depth=depth,
-                              image_path=f'target_rgb_{uid}', image_name=image_name, width=width, height=height)
+        cam_info = SpatialGenCameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image, depth=depth,
+                              image_path=f'target_rgb_{uid}', image_name=image_name, width=width, height=height,
+                              points=tar_point, colors=tar_color, scales=scales)
         cam_infos.append(cam_info)
     
     return cam_infos
@@ -415,8 +444,8 @@ def readSpatialGenSceneInfo(path, eval, load_depth=True):
         print(e)
         sys.exit(-1)
         
-    cam_infos_unsorted = readSpatialgenCameras(data_dict=room_infer_results, load_depth=load_depth)
-    cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
+    cam_infos_unsorted: List[SpatialGenCameraInfo] = readSpatialgenCameras(data_dict=room_infer_results, load_depth=load_depth)
+    cam_infos: List[SpatialGenCameraInfo] = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
     # holdout_infos = sorted(holdout_infos_unsorted.copy(), key = lambda x : x.image_name)
 
     if eval:
@@ -428,16 +457,32 @@ def readSpatialGenSceneInfo(path, eval, load_depth=True):
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
-    ply_path = os.path.join(path, "gs_ply.ply")
-    o3d_ply_path = os.path.join(path, "global_scene_ply.ply")
+    # ply_path = os.path.join(path, "gs_ply.ply")
+    # o3d_ply_path = os.path.join(path, "global_scene_ply.ply")
+    # if not os.path.exists(ply_path):
+    #     print("Converting point cloud from open3d to plydata, will happen only the first time you open the scene.")
+    #     import open3d as o3d
+    #     o3d_ply = o3d.io.read_point_cloud(o3d_ply_path)
+    #     xyz = np.array(o3d_ply.points)
+    #     rgb = np.array(o3d_ply.colors)
+    #     print(f"xyz shape: {xyz.shape}, rgb shape: {rgb.shape}")
+    #     storePly(ply_path, xyz, rgb)
+    ply_path = os.path.join(path, "points3D.ply")
     if not os.path.exists(ply_path):
-        print("Converting point cloud from open3d to plydata, will happen only the first time you open the scene.")
-        import open3d as o3d
-        o3d_ply = o3d.io.read_point_cloud(o3d_ply_path)
-        xyz = np.array(o3d_ply.points)
-        rgb = np.array(o3d_ply.colors)
-        print(f"xyz shape: {xyz.shape}, rgb shape: {rgb.shape}")
-        storePly(ply_path, xyz, rgb)
+        print("Converting point cloud from SpatialGenCameraInfo to plydata, will happen only the first time you open the scene.")
+        xyz_lst, rgb_lst, scale_lst = [], [], []
+        for cam_info in train_cam_infos:
+            if cam_info.points is not None:
+                xyz = cam_info.points
+                rgb = cam_info.colors
+                scale = cam_info.scales
+                xyz_lst.append(xyz)
+                rgb_lst.append(rgb)
+                scale_lst.append(scale)
+        xyz_lst = np.concatenate(xyz_lst, axis=0)
+        rgb_lst = np.concatenate(rgb_lst, axis=0)
+        scale_lst = np.concatenate(scale_lst, axis=0)
+        storePly(ply_path, xyz_lst, rgb_lst, scale_lst)
     try:
         pcd = fetchPly(ply_path)
     except:

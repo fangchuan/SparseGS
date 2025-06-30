@@ -69,7 +69,7 @@ def render_set(model_path: str, name: str, iteration: int, views: List[Camera], 
 
     # render on interpolated trajectory
     rendered_rgbs, rendered_depths = [], []
-    interp_views = gs_interpolate_trajectory(views, nframes_interval=4)
+    interp_views = gs_interpolate_trajectory(views, nframes_interval=20)
     for idx, view in enumerate(tqdm(interp_views, desc="Rendering progress")):
         view: Camera
         results = render(view, gaussians, pipeline, background)

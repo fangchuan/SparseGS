@@ -15,6 +15,9 @@ import numpy as np
 from utils.graphics_utils import getWorld2View2, getProjectionMatrix
 import matplotlib.pyplot as plt
 import os
+from einops import rearrange
+from utils.typing import *
+from utils.torch3d_utils import torch3d_rasterize_points
 
 def build_rot_y(th):
         return torch.Tensor([
@@ -22,6 +25,20 @@ def build_rot_y(th):
         [0, 1, 0],
         [np.sin(th), 0, np.cos(th)]])
 
+def depth_to_pointcloud(depth_map, K) -> np.array:
+    H, W = depth_map.shape[0], depth_map.shape[1]
+    n_pts = H * W
+    depth_map = depth_map.reshape(1, H, W)
+
+    pts_x = np.linspace(0, W, W)
+    pts_y = np.linspace(0, H, H)
+    
+    pts_xx, pts_yy = np.meshgrid(pts_x, pts_y)
+
+    pts = np.stack((pts_xx, pts_yy, np.ones_like(pts_xx)), axis=0)
+    pts = np.linalg.inv(K) @ (pts * depth_map).reshape(3, n_pts)
+    return pts.transpose()
+    
 class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, image, depth, gt_alpha_mask,
                  image_name, uid, warp_mask, K, src_R, src_T, src_uid,
@@ -31,8 +48,8 @@ class Camera(nn.Module):
 
         self.uid = uid
         self.colmap_id = colmap_id
-        self.R = R
-        self.T = T
+        self.R = R   # c2w rotation
+        self.T = T   # w2c translation
         self.FoVx = FoVx
         self.FoVy = FoVy
         self.image_name = image_name
@@ -105,8 +122,10 @@ class Camera(nn.Module):
             img = img.detach().cpu().numpy().transpose(1,2,0)
             depth_map = depth_map.detach().cpu().numpy()
             # Scale monodepth to COLMAP coordinate
-            scaled_depth = (depth_map - depth_map.min())/(depth_map.max() - depth_map.min())
-            scaled_depth = scaled_depth * (rendered_depth_max - rendered_depth_min) + rendered_depth_min
+            # scaled_depth = (depth_map - depth_map.min())/(depth_map.max() - depth_map.min())
+            # scaled_depth = scaled_depth * (rendered_depth_max - rendered_depth_min) + rendered_depth_min
+            # for SpatialGen data, depth_map is metric depth
+            scaled_depth = depth_map
             R_AB = R_B @ np.linalg.inv(R_A)
             T_AB = T_B - (R_AB @ T_A)
             K = K.clone().cpu().numpy()
@@ -139,6 +158,49 @@ class Camera(nn.Module):
             out_img = warped_img
             return out_img.transpose(2,0,1), warp_mask
 
+        def depth_warping_pt3d(src_img: Float[Tensor, "C H W"], 
+                               src_depth: Float[Tensor, "H W"], 
+                               K: Float[Tensor, "3 3"], 
+                               R_A: np.array, 
+                               T_A: np.array, 
+                               R_B: np.array, 
+                               T_B: np.array):
+
+            # warp the depth maps to target views
+            colors = src_img[None, :, :, :]
+            h, w = src_img.shape[1], src_img.shape[2]
+            
+            points: Float[np.array, "Np 3"] = depth_to_pointcloud(src_depth.cpu().numpy(), K.cpu().numpy())
+            batch_input_points: Float[Tensor, "B Np 3"] = torch.from_numpy(points).to(src_img)[None, :, :]
+            batch_input_colors: Float[Tensor, "B 3 Np"] = rearrange(colors, "B C H W -> B (H W) C", H=h, W=w)
+            
+            pointcloud = torch.cat([batch_input_points, batch_input_colors], dim=-1)  # B, Np, 6
+            pointcloud: Float[Tensor, "BNp 6"] = rearrange(pointcloud, "B Np C -> (B Np) C")
+            
+            src_w2c_pose = np.eye(4)
+            src_w2c_pose[:3, :3] = R_A.T
+            src_w2c_pose[:3, 3] = T_A
+            tar_w2c_pose = np.eye(4)
+            tar_w2c_pose[:3, :3] = R_B.T
+            tar_w2c_pose[:3, 3] = T_B
+            relative_w2c_poses = tar_w2c_pose @ np.linalg.inv(src_w2c_pose)
+            relative_w2c_poses = torch.from_numpy(relative_w2c_poses).to(src_img)
+            projected_tar_imgs, projected_tar_depths = torch3d_rasterize_points(
+                cv_cam_poses_c2w=None,
+                cv_cam_poses_w2c=relative_w2c_poses[None, :, :].float(),
+                in_pointcloud=pointcloud.float(),
+                intrinsic=K.float().to(src_img),
+                image_width=w,
+                image_height=h,
+                point_radius=0.01,
+                device=src_img.device,
+            )
+            projected_tar_imgs = projected_tar_imgs.clamp(0, 1)
+            rendered_masks: Float[Tensor, "B 1 H W"] = (projected_tar_imgs.mean(1, keepdim=True) > 0.01).float().clamp(0, 1)
+            out_img = projected_tar_imgs[0].cpu().numpy()
+            warp_mask = rendered_masks[0, 0].cpu().numpy()
+            return out_img, warp_mask
+            
         src_img = self.original_image # Torch tensor
         scaled_depth = self.depth # Torch tensor
         src_R = self.src_R
@@ -146,15 +208,29 @@ class Camera(nn.Module):
         trg_R = self.R
         trg_T = self.T
         K = self.K
+        uid = (self.uid)
+        # format .2f
         uid = self.uid
-        print('Warping',self.src_uid,'to',self.uid,'dp min:',round(rendered_depth_min,5),'dp max:',round(rendered_depth_max,5))
-        warped_img, warped_mask = depth_warping(src_img, scaled_depth, K, src_R, src_T, trg_R, trg_T, rendered_depth_min, rendered_depth_max)
+        print(f'Warping {self.src_uid} to {uid: .2f}, dp min: {round(rendered_depth_min,5)}, dp max: {round(rendered_depth_max,5)}' )
+        # warped_img, warped_mask = depth_warping(src_img, scaled_depth, K, src_R, src_T, trg_R, trg_T, rendered_depth_min, rendered_depth_max)
+        warped_img, warped_mask = depth_warping_pt3d(src_img, scaled_depth, K, src_R, src_T, trg_R, trg_T)
 
         warped_mask = warped_mask.astype(np.double)
         warped_img = torch.from_numpy(warped_img).to(torch.float32).to('cuda').detach()
         warped_mask = torch.from_numpy(warped_mask).to(torch.float32).to('cuda').detach()
         self.original_image = warped_img
         self.warp_mask = warped_mask
+        
+        # import matplotlib.pyplot as plt
+        # plt.figure()
+        # plt.subplot(3,1,1)
+        # plt.imshow(src_img.clamp(0,1).detach().cpu().numpy().transpose(1,2,0))
+        # plt.subplot(3,1,2)
+        # plt.imshow(warped_img.detach().cpu().numpy().transpose(1,2,0))
+        # plt.subplot(3,1,3)
+        # plt.imshow(warped_mask.detach().cpu().numpy())
+        # plt.savefig(f"warp_{uid:.2f}.jpg", bbox_inches='tight')
+        # plt.close()
 
 
 

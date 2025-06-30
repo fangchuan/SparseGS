@@ -20,6 +20,7 @@ from scene.gaussian_model import GaussianModel
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
 from utils.pose_utils import setup_ellipse_sampling, viewmatrix
+from utils.traj_ops import gs_interpolate_trajectory
 
 
 class Scene:
@@ -30,7 +31,7 @@ class Scene:
                  args : ModelParams, 
                  gaussians : GaussianModel, 
                  load_iteration=None, 
-                 shuffle=True, 
+                 shuffle=False, 
                  resolution_scales=[1.0], 
                  step=1, 
                  max_cameras=None, 
@@ -95,17 +96,41 @@ class Scene:
             transform, center, up, low, high, z_low, z_high, ts, t_thetas = setup_ellipse_sampling(self.train_cameras[resolution_scale])       
             self.ellipse_params[resolution_scale] = {"transform": transform, "center": center, "up": up, "low": low, "high": high, "z_low": z_low, "z_high": z_high, "ts": ts, "t_thetas": t_thetas}
             if mode != 'eval':
-            # # Rotate around average up vector
+            # # # Rotate around average up vector
+            #     train_cam_list = self.train_cameras[resolution_scale]
+            #     num_poses = len(train_cam_list)
+            #     R_list = list()
+            #     T_list = list()
+            #     for cam in train_cam_list:
+            #         R_list.append(cam.R)
+            #         T_list.append(cam.T)
+            #     R_matrices = np.stack(R_list)
+            #     T_vectors = np.stack(T_list)
+            #     avg_up_vector = calculate_average_up_vector(R_matrices)
+                
+            #     cam_focal_dict = dict()
+            #     for i in json_cams:
+            #         cam_focal_dict[i['id']] = (i['fx'],i['fy'])
+
+            #     # Warping camera angles
+            #     novel_cam_append_list = list()
+            #     for d in [-45.5, -30.5, -12.5, -2.5, 2.5, 12.5, 30.5, 45.5]:
+            #         degree = d
+            #         new_R_matrices, new_T_vectors = rotate_camera_poses(avg_up_vector, R_matrices,
+            #                                                             T_vectors, degree * np.pi / 180)
+            #         for idx in range(num_poses):
+            #             train_cam = train_cam_list[idx]
+            #             novel_cam_append_list.append(create_cam_obj(cam=train_cam,
+            #                                                         degree=degree,
+            #                                                         R=new_R_matrices[idx,:,:],
+            #                                                         T=new_T_vectors[idx,:],
+            #                                                         scaling_factor=args.resolution,
+            #                                                         cam_focal_dict=cam_focal_dict))
+            #     self.ft_cameras[resolution_scale] = novel_cam_append_list
+                
+            # # Interpolate the train cameras
                 train_cam_list = self.train_cameras[resolution_scale]
                 num_poses = len(train_cam_list)
-                R_list = list()
-                T_list = list()
-                for cam in train_cam_list:
-                    R_list.append(cam.R)
-                    T_list.append(cam.T)
-                R_matrices = np.stack(R_list)
-                T_vectors = np.stack(T_list)
-                avg_up_vector = calculate_average_up_vector(R_matrices)
                 
                 cam_focal_dict = dict()
                 for i in json_cams:
@@ -113,14 +138,25 @@ class Scene:
 
                 # Warping camera angles
                 novel_cam_append_list = list()
-                for d in [-2.5, 2.5]:
-                    degree = d
-                    new_R_matrices, new_T_vectors = rotate_camera_poses(avg_up_vector, R_matrices,
-                                                                        T_vectors, degree * np.pi / 180)
-                    for idx in range(num_poses):
-                        train_cam = train_cam_list[idx]
-                        novel_cam_append_list.append(create_cam_obj(train_cam,degree,
-                                                                    new_R_matrices[idx,:,:],new_T_vectors[idx,:],args.resolution,cam_focal_dict))
+                for idx in range(num_poses -1):
+                    train_cams = train_cam_list[idx: idx + 2]
+                    interp_cams_list = gs_interpolate_trajectory(train_cams, nframes_interval=20)
+                    
+                    for idx, interp_cam in enumerate(interp_cams_list):
+                        if idx == 0 or idx == len(interp_cams_list) -1:
+                            continue
+                        novel_cam_append_list.append(create_cam_obj(cam=train_cams[0],
+                                                                    degree=idx,
+                                                                    R=interp_cam.R,
+                                                                    T=interp_cam.T,
+                                                                    scaling_factor=args.resolution,
+                                                                    cam_focal_dict=cam_focal_dict))
+                        # novel_cam_append_list.append(create_cam_obj(cam=train_cams[1],
+                        #                                             degree=-idx,
+                        #                                             R=interp_cam.R,
+                        #                                             T=interp_cam.T,
+                        #                                             scaling_factor=args.resolution,
+                        #                                             cam_focal_dict=cam_focal_dict))
                 self.ft_cameras[resolution_scale] = novel_cam_append_list
 
 
