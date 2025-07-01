@@ -82,7 +82,8 @@ class ModelParams(ParamGroup):
         # Warp Reg parms
         self.lambda_reg = 0.0
         self.warp_reg_start_itr = 4999
-
+        self.disable_filter3D = False
+        self.kernel_size = 0.0 # Size of 2D filter in mip-splatting
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -109,8 +110,11 @@ class OptimizationParams(ParamGroup):
         self.opacity_lr = 0.05
         self.scaling_lr = 0.005
         self.rotation_lr = 0.001
+        self.appearance_embeddings_lr = 0.001
+        self.appearance_network_lr = 0.001
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
+        self.lambda_depth_normal = 0.05
         self.densification_interval = 100
         self.opacity_reset_interval = 3000
         self.densify_from_iter = 500

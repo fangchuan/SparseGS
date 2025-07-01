@@ -12,3 +12,7 @@ accelerate==1.6.0
 imageio
 imageio-ffmpeg
 numpy==1.26.4
+einops
+jaxtyping
+omegaconf
+typeguard

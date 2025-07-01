@@ -17,6 +17,8 @@ import sys
 from scene import Scene, GaussianModel
 from scene.cameras import Camera
 from utils.general_utils import safe_state, normalize
+from utils.graphics_utils import depth_double_to_normal
+
 import time
 import uuid
 from tqdm import tqdm
@@ -32,7 +34,36 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
+from utils.typing import *
+from lpipsPyTorch import lpips
 
+from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+
+lpips_func = LearnedPerceptualImagePatchSimilarity(normalize=True).to('cuda')
+    
+# function L1_loss_appearance is fork from GOF https://github.com/autonomousvision/gaussian-opacity-fields/blob/main/train.py
+def L1_loss_appearance(image, gt_image, gaussians: GaussianModel, view_idx, return_transformed_image=False):
+    appearance_embedding = gaussians.get_apperance_embedding(view_idx)
+    # center crop the image
+    origH, origW = image.shape[1:]
+    H = origH // 32 * 32
+    W = origW // 32 * 32
+    left = origW // 2 - W // 2
+    top = origH // 2 - H // 2
+    crop_image = image[:, top:top+H, left:left+W]
+    crop_gt_image = gt_image[:, top:top+H, left:left+W]
+    
+    # down sample the image
+    crop_image_down = torch.nn.functional.interpolate(crop_image[None], size=(H//32, W//32), mode="bilinear", align_corners=True)[0]
+    
+    crop_image_down = torch.cat([crop_image_down, appearance_embedding[None].repeat(H//32, W//32, 1).permute(2, 0, 1)], dim=0)[None]
+    mapping_image = gaussians.appearance_network(crop_image_down)
+    transformed_image = mapping_image * crop_image
+    if not return_transformed_image:
+        return l1_loss(transformed_image, crop_gt_image)
+    else:
+        transformed_image = torch.nn.functional.interpolate(transformed_image, size=(origH, origW), mode="bilinear", align_corners=True)[0]
+        return transformed_image
 
     
 
@@ -66,6 +97,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         guidance_sd.get_text_embeds([""], [""])
         print(f"[INFO] loaded SD!")
 
+    trainCameras: List[Camera] = scene.getTrainCameras().copy()
+    if dataset.disable_filter3D:
+        gaussians.reset_3D_filter()
+    else:
+        gaussians.compute_3D_filter(cameras=trainCameras)
+        
     warp_cam_stack = None
     
     save_cc = 0
@@ -123,7 +160,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 warp_cam_stack = scene.getFtCameras().copy()
             warp_cam: Camera = warp_cam_stack.pop(randint(0, len(warp_cam_stack)-1))
             warp_render_pkg = render(warp_cam, gaussians, pipe, background)
-            warp_image, warp_viewspace_point_tensor, warp_visibility_filter, warp_radii = warp_render_pkg["render"], warp_render_pkg["viewspace_points"], warp_render_pkg["visibility_filter"], warp_render_pkg["radii"]
+            warp_image, warp_viewspace_point_tensor, warp_visibility_filter, warp_radii = (warp_render_pkg["render"], 
+                                                                                           warp_render_pkg["viewspace_points"], 
+                                                                                           warp_render_pkg["visibility_filter"], 
+                                                                                           warp_render_pkg["radii"])
             reg_gt_image = warp_cam.original_image.cuda()
             reg_mask = warp_cam.warp_mask
 
@@ -132,19 +172,68 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if (iteration - 1) == debug_from:
             pipe.debug = True
         bg = torch.rand((3), device="cuda") if opt.random_background else background
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
-        image, viewspace_point_tensor, visibility_filter, radii, depth = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"], render_pkg["depth"]
+        # render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
+        # image, viewspace_point_tensor, visibility_filter, radii, depth = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"], render_pkg["depth"]
+        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, kernel_size=0.0, require_coord=True, require_depth=True)
+        rendered_image: torch.Tensor
+        rendered_image, viewspace_point_tensor, visibility_filter, radii, depth = (
+                                                                    render_pkg["render"], 
+                                                                    render_pkg["viewspace_points"], 
+                                                                    render_pkg["visibility_filter"], 
+                                                                    render_pkg["radii"],
+                                                                    render_pkg["median_depth"])
         gt_image = viewpoint_cam.original_image.cuda()
+        
+        # if iteration == 1:
+        #     # save rendered rgb annd depth
+        #     import matplotlib.pyplot as plt
+        #     plt.figure()
+        #     plt.subplot(3,1,1)
+        #     plt.imshow(gt_image.clamp(0,1).detach().cpu().numpy().transpose(1,2,0))
+        #     plt.subplot(3,1,2)
+        #     plt.imshow(rendered_image.detach().cpu().numpy().transpose(1,2,0))
+        #     plt.subplot(3,1,3)
+        #     plt.imshow(depth.squeeze().detach().cpu().numpy())
+        #     plt.savefig(f"itr_{iteration}_{viewpoint_cam.uid:.2f}.png", bbox_inches='tight', dpi=1000)
+        #     plt.close()
 
         # Loss
-        Ll1 = l1_loss(image, gt_image)
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
-        # # compute lpips loss and weigth
-        # from lpipsPyTorch import lpips
-        # lambda_lpips = 0.25
-        # lpiploss = lpips(image.float(), gt_image.float(), net_type='vgg')
-        # loss = (1.0 - opt.lambda_dssim - lambda_lpips) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image)) + lambda_lpips * lpiploss
+        # Ll1 = l1_loss(rendered_image, gt_image)
+        # loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(rendered_image, gt_image))
 
+        use_decoupled_appearance = False
+        if use_decoupled_appearance:
+            Ll1_render = L1_loss_appearance(rendered_image, gt_image, gaussians, viewpoint_cam.uid)
+        else:
+            Ll1_render = l1_loss(rendered_image, gt_image)
+
+        reg_kick_on = iteration >= 15000
+        if reg_kick_on:
+            lambda_depth_normal = opt.lambda_depth_normal
+            if True:
+                rendered_expected_depth: torch.Tensor = render_pkg["expected_depth"]
+                rendered_median_depth: torch.Tensor = render_pkg["median_depth"]
+                rendered_normal: torch.Tensor = render_pkg["normal"]
+                depth_middepth_normal = depth_double_to_normal(viewpoint_cam, rendered_expected_depth, rendered_median_depth)
+            else:
+                rendered_expected_coord: torch.Tensor = render_pkg["expected_coord"]
+                rendered_median_coord: torch.Tensor = render_pkg["median_coord"]
+                rendered_normal: torch.Tensor = render_pkg["normal"]
+                depth_middepth_normal = point_double_to_normal(viewpoint_cam, rendered_expected_coord, rendered_median_coord)
+            depth_ratio = 0.6
+            normal_error_map = (1 - (rendered_normal.unsqueeze(0) * depth_middepth_normal).sum(dim=1))
+            depth_normal_loss = (1-depth_ratio) * normal_error_map[0].mean() + depth_ratio * normal_error_map[1].mean()
+        else:
+            lambda_depth_normal = 0
+            depth_normal_loss = torch.tensor([0],dtype=torch.float32,device="cuda")
+            
+        # compute lpips loss and weigth
+        lambda_lpips = 0.25
+        # lpiploss = lpips(rendered_image.float(), gt_image.float(), net_type='vgg').mean()
+        lpiploss = lpips_func((rendered_image[None, ...].float()).clamp(0., 1.), gt_image[None, ...].float())
+        # print(f"lpips loss: {lpiploss}")
+        rgb_loss = (1.0 - opt.lambda_dssim - lambda_lpips) * Ll1_render + opt.lambda_dssim * (1.0 - ssim(rendered_image, gt_image.unsqueeze(0))) + lambda_lpips * lpiploss
+        loss = rgb_loss + depth_normal_loss * lambda_depth_normal
        
         diffusion_loss = None
         lp_loss = None
@@ -155,9 +244,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             pearson_loss = pearson_depth_loss(depth.squeeze(0), viewpoint_cam.depth)
             loss += dataset.lambda_pearson * pearson_loss
         
-        if dataset.lambda_local_pearson > 0 and (not pick_warp_cam):
-            lp_loss = local_pearson_loss(depth.squeeze(0), viewpoint_cam.depth, dataset.box_p, dataset.p_corr)
-            loss += dataset.lambda_local_pearson * lp_loss
+        # if dataset.lambda_local_pearson > 0 and (not pick_warp_cam):
+        #     lp_loss = local_pearson_loss(depth.squeeze(0), viewpoint_cam.depth, dataset.box_p, dataset.p_corr)
+        #     loss += dataset.lambda_local_pearson * lp_loss
         
         if pick_diff_cam:
             diffusion_loss = guidance_sd.train_step(diff_image.unsqueeze(0), dataset.step_ratio)
@@ -165,7 +254,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         if pick_warp_cam:
             reg_Ll1 = mask_l1_loss(warp_image, reg_gt_image, reg_mask)
-            reg_loss = (1.0 - opt.lambda_dssim) * reg_Ll1 + opt.lambda_dssim * (1.0 - ssim(warp_image, reg_gt_image))
+            # reg_lpips_loss = (lpips(warp_image.float(), c.float(), net_type='vgg') * reg_mask).mean()
+            masked_warp_image = warp_image * reg_mask
+            reg_lpips_loss = lpips_func((masked_warp_image[None, ...].float()).clamp(0., 1.), reg_gt_image[None, ...].float())
+            # print(f"reg_lpips loss: {reg_lpips_loss}")
+            reg_loss = (1.0 - opt.lambda_dssim - lambda_lpips) * reg_Ll1 + opt.lambda_dssim * (1.0 - ssim(warp_image, reg_gt_image)) + lambda_lpips * reg_lpips_loss
             loss += dataset.lambda_reg * reg_loss 
 
         loss.backward()
@@ -182,8 +275,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 src_cam_stack = scene.getTrainCameras().copy()
                 src_depth_dict = dict()
                 for each_src_cam in src_cam_stack:
-                    src_render_pkg = render(each_src_cam, gaussians, pipe, background)
-                    src_depth = src_render_pkg["alpha_depth"]
+                    src_render_pkg = render(each_src_cam, gaussians, pipe, background, kernel_size=0.0, require_coord=True, require_depth=True)
+                    src_depth = src_render_pkg["expected_depth"]
                     src_depth_dict[each_src_cam.uid] = src_depth
                 _warp_cam_stack = scene.getFtCameras()
                 for _cam in _warp_cam_stack:
@@ -194,7 +287,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             if iteration % 10 == 0:
                 postfix_dict = {"EMA Loss": f"{ema_loss_for_log:.{7}f}",
-                                          "Total Loss": f"{loss:.{7}f}"}
+                                          "Total Loss": f"{loss.item():.{7}f}"}
 
                 for l,n in zip(losses, names):
                     if l is not None:
@@ -206,7 +299,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             # Log and save
             tr_dict = {names[i]: losses[i] for i in range(len(losses))}
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, tr_dict,  iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
+            # training_report(tb_writer, iteration, Ll1, loss, l1_loss, tr_dict,  iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
+            training_report(tb_writer, iteration, Ll1_render, loss, depth_normal_loss, l1_loss, tr_dict, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
+            
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -220,7 +315,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.05, scene.cameras_extent, size_threshold)
-                
+                    if dataset.disable_filter3D:
+                        gaussians.reset_3D_filter()
+                    else:
+                        gaussians.compute_3D_filter(cameras=trainCameras)
+
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
 
@@ -233,7 +332,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.05, scene.cameras_extent, size_threshold)
-                
+                    if dataset.disable_filter3D:
+                        gaussians.reset_3D_filter()
+                    else:
+                        gaussians.compute_3D_filter(cameras=trainCameras)
+                        
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
 
@@ -391,12 +494,13 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, tr_dict, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
+def training_report(tb_writer, iteration, Ll1, loss, normal_loss, l1_loss, tr_dict, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
     if tb_writer:
         for k,v in tr_dict.items():
             if v is not None:
                 tb_writer.add_scalar('train_loss_patches/' + k, v.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
+        tb_writer.add_scalar('train_loss_patches/normal_loss', normal_loss.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar('iter_time', elapsed, iteration)
 
@@ -441,8 +545,8 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[1, 7_000, 30_000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 15000, 30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[7000, 15000, 30000])
     parser.add_argument("--start_checkpoint", type=str, default = None)
