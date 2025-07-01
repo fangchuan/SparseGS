@@ -30,9 +30,9 @@ for i in "${!spatialgen_scenes[@]}"; do
         --lambda_diffusion 0.000 \
         --SDS_freq 0.1 \
         --step_ratio 0.99 \
-        --lambda_reg 0.2 \
+        --lambda_reg 0.4 \
         --prune_sched 20000 \
-        --prune_perc 0.98 \
+        --prune_perc 0.88 \
         --prune_exp 7.5 \
         --iterations 30000 \
         -r 1 \
