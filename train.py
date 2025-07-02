@@ -35,11 +35,11 @@ except ImportError:
     TENSORBOARD_FOUND = False
 
 from utils.typing import *
-from lpipsPyTorch import lpips
+# from lpipsPyTorch import lpips
 
-from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+# from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
-lpips_func = LearnedPerceptualImagePatchSimilarity(normalize=True).to('cuda')
+# lpips_func = LearnedPerceptualImagePatchSimilarity(normalize=True).to('cuda')
     
 # function L1_loss_appearance is fork from GOF https://github.com/autonomousvision/gaussian-opacity-fields/blob/main/train.py
 def L1_loss_appearance(image, gt_image, gaussians: GaussianModel, view_idx, return_transformed_image=False):
@@ -228,11 +228,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             depth_normal_loss = torch.tensor([0],dtype=torch.float32,device="cuda")
             
         # compute lpips loss and weigth
-        lambda_lpips = 0.25
-        # lpiploss = lpips(rendered_image.float(), gt_image.float(), net_type='vgg').mean()
-        lpiploss = lpips_func((rendered_image[None, ...].float()).clamp(0., 1.), gt_image[None, ...].float())
+        # lambda_lpips = 0.25
+        # lpiploss = lpips_func((rendered_image[None, ...].float()).clamp(0., 1.), gt_image[None, ...].float())
         # print(f"lpips loss: {lpiploss}")
-        rgb_loss = (1.0 - opt.lambda_dssim - lambda_lpips) * Ll1_render + opt.lambda_dssim * (1.0 - ssim(rendered_image, gt_image.unsqueeze(0))) + lambda_lpips * lpiploss
+        # rgb_loss = (1.0 - opt.lambda_dssim - lambda_lpips) * Ll1_render + opt.lambda_dssim * (1.0 - ssim(rendered_image, gt_image.unsqueeze(0))) + lambda_lpips * lpiploss
+        rgb_loss = (1.0 - opt.lambda_dssim) * Ll1_render + opt.lambda_dssim * (1.0 - ssim(rendered_image, gt_image.unsqueeze(0)))
         loss = rgb_loss + depth_normal_loss * lambda_depth_normal
        
         diffusion_loss = None
@@ -254,11 +254,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         if pick_warp_cam:
             reg_Ll1 = mask_l1_loss(warp_image, reg_gt_image, reg_mask)
-            # reg_lpips_loss = (lpips(warp_image.float(), c.float(), net_type='vgg') * reg_mask).mean()
-            masked_warp_image = warp_image * reg_mask
-            reg_lpips_loss = lpips_func((masked_warp_image[None, ...].float()).clamp(0., 1.), reg_gt_image[None, ...].float())
+            # masked_warp_image = warp_image * reg_mask
+            # reg_lpips_loss = lpips_func((masked_warp_image[None, ...].float()).clamp(0., 1.), reg_gt_image[None, ...].float())
             # print(f"reg_lpips loss: {reg_lpips_loss}")
-            reg_loss = (1.0 - opt.lambda_dssim - lambda_lpips) * reg_Ll1 + opt.lambda_dssim * (1.0 - ssim(warp_image, reg_gt_image)) + lambda_lpips * reg_lpips_loss
+            # reg_loss = (1.0 - opt.lambda_dssim - lambda_lpips) * reg_Ll1 + opt.lambda_dssim * (1.0 - ssim(warp_image, reg_gt_image)) + lambda_lpips * reg_lpips_loss
+            reg_loss = (1.0 - opt.lambda_dssim) * reg_Ll1 + opt.lambda_dssim * (1.0 - ssim(warp_image, reg_gt_image))
             loss += dataset.lambda_reg * reg_loss 
 
         loss.backward()
