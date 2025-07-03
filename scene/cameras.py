@@ -13,8 +13,7 @@ import torch
 from torch import nn
 import numpy as np
 from utils.graphics_utils import getWorld2View2, getProjectionMatrix
-import matplotlib.pyplot as plt
-import os
+import torch.nn.functional as F
 from einops import rearrange
 from utils.typing import *
 from utils.torch3d_utils import torch3d_rasterize_points
@@ -39,6 +38,32 @@ def depth_to_pointcloud(depth_map, K) -> np.array:
     pts = np.linalg.inv(K) @ (pts * depth_map).reshape(3, n_pts)
     return pts.transpose()
     
+# function edge_filter is fork from VistaDream https://github.com/WHU-USI3DV/VistaDream
+def nei_delta(input, pad=2):
+    if not type(input) is torch.Tensor:
+        input = torch.from_numpy(input.astype(np.float32))
+    if len(input.shape) < 3:
+        input = input[:, :, None]
+    h, w, c = input.shape
+    # reshape
+    input = input.permute(2, 0, 1)[None]
+    input = F.pad(input, pad=(pad, pad, pad, pad), mode="replicate")
+    kernel = 2 * pad + 1
+    input = F.unfold(input, [kernel, kernel], padding=0)
+    input = input.reshape(c, -1, h, w).permute(2, 3, 0, 1).squeeze()  # hw(3)*25
+    return torch.amax(input, dim=-1), torch.amin(input, dim=-1), input
+
+def edge_filter(metric_dpt, valid_mask=None, times=0.1):
+    if valid_mask is None:
+        valid_mask = np.ones_like(metric_dpt, dtype=bool)
+    _max = np.percentile(metric_dpt[valid_mask], 95)
+    _min = np.percentile(metric_dpt[valid_mask], 5)
+    _range = _max - _min
+    nei_max, nei_min, _ = nei_delta(metric_dpt)
+    delta = (nei_max - nei_min).numpy()
+    edge = delta > times * _range
+    return edge
+
 class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, image, depth, gt_alpha_mask,
                  image_name, uid, warp_mask, K, src_R, src_T, src_uid,
@@ -87,77 +112,23 @@ class Camera(nn.Module):
         self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
         self.camera_center = self.world_view_transform.inverse()[3, :3]
         
-        def gen_hemisphere_view(self, theta, center):
-            cam_focus = torch.Tensor(self.T) - center
-            rot_y = build_rot_y(theta)
-            t_n = torch.Tensor(rot_y @ cam_focus + center)
+    def update_R_and_T(self, R, T):
+        self.R = R
+        self.T = T
+        self.world_view_transform = torch.tensor(getWorld2View2(R, T, self.trans, self.scale)).transpose(0, 1).cuda()
+        self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy).transpose(0,1).cuda()
+        self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
+        self.camera_center = self.world_view_transform.inverse()[3, :3]
+    
+    def update_view_transform(self, view2world: Float[Tensor, "4 4"]):
+        world2view = torch.inverse(view2world)
+        self.R = view2world[:3, :3].detach().cpu().numpy()
+        self.T = world2view[:3, 3].detach().cpu().numpy()
+        self.world_view_transform = world2view.transpose(0, 1).cuda()
+        self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
+        self.camera_center = self.world_view_transform.inverse()[3, :3]
 
-            E_ref = torch.Tensor(getWorld2View2(self.R, self.T))
-            E_n = torch.Tensor(getWorld2View2(self.R, t_n))
-            ref_img = torch.Tensor(self.original_image).cpu()
-            ref_depth = torch.Tensor(self.depth)
-            K_ref = torch.Tensor(self.cam_intr)
-
-            new_look_at = center - t_n
-            new_look_at = new_look_at / torch.linalg.norm(new_look_at)
-            new_right = rot_y @ self.R[:,1]
-            new_right = new_right / torch.linalg.norm(new_right)
-            new_up = torch.cross(new_look_at.float(), new_right.float())
-
-            R_n = torch.stack((new_right, new_up, new_look_at), dim=1)
-
-    def generate_warp_gt(self, rendered_depth_min, rendered_depth_max):
-        def depth_warping(img, depth_map, K, R_A, T_A, R_B, T_B,  rendered_depth_min, rendered_depth_max):
-            ''' 
-            img: src image
-            K: Intrinsics
-            R_A, T_A: Extrinsics matrix of the src image
-            R_B, T_B: Extrinsics matrix of the target image
-            depth_map: Mono Depth from the src camera
-            rendered_depth_min/_max: 3dgs rendered depth min/max from the src camera in COLMAP coordinate
-            '''
-            # Calculate the transformation from A to B
-            R_A = R_A.T
-            R_B = R_B.T
-            img = img.detach().cpu().numpy().transpose(1,2,0)
-            depth_map = depth_map.detach().cpu().numpy()
-            # Scale monodepth to COLMAP coordinate
-            # scaled_depth = (depth_map - depth_map.min())/(depth_map.max() - depth_map.min())
-            # scaled_depth = scaled_depth * (rendered_depth_max - rendered_depth_min) + rendered_depth_min
-            # for SpatialGen data, depth_map is metric depth
-            scaled_depth = depth_map
-            R_AB = R_B @ np.linalg.inv(R_A)
-            T_AB = T_B - (R_AB @ T_A)
-            K = K.clone().cpu().numpy()
-            K_inv = np.linalg.inv(K)
-            height, width = img.shape[:2]
-            warp_mask = np.zeros((height, width), dtype=np.double)
-            warped_img = np.zeros_like(img)
-
-            for y in range(height):
-                for x in range(width):
-                    Z = scaled_depth[y, x]
-                    
-                    xy_homog = np.array([x, y, 1])
-
-                    # Convert to COLMAP coordinate system
-                    xy_normalized = K_inv @ xy_homog
-                    # Backproject to 3D 
-                    P_A = Z * xy_normalized
-                    # A-B Transformation matrix
-                    P_B = R_AB @ P_A[:3] + T_AB
-                    # Project onto camera B's image plane
-                    xy_b_homog = K @ P_B
-                    # Normalize to get the pixel coordinates
-                    x_b, y_b = (xy_b_homog / xy_b_homog[2])[:2]
-                    x_b, y_b = int(round(x_b)), int(round(y_b))
-                    # Check bounds
-                    if 0 <= x_b < width and 0 <= y_b < height:
-                        warped_img[y_b, x_b] = img[y, x]
-                        warp_mask[y_b, x_b] = 1.0
-            out_img = warped_img
-            return out_img.transpose(2,0,1), warp_mask
-
+    def generate_warp_gt(self):
         def depth_warping_pt3d(src_img: Float[Tensor, "C H W"], 
                                src_depth: Float[Tensor, "H W"], 
                                K: Float[Tensor, "3 3"], 
@@ -196,10 +167,11 @@ class Camera(nn.Module):
                 device=src_img.device,
             )
             projected_tar_imgs = projected_tar_imgs.clamp(0, 1)
-            rendered_masks: Float[Tensor, "B 1 H W"] = (projected_tar_imgs.mean(1, keepdim=True) > 0.01).float().clamp(0, 1)
+            rendered_masks: Bool[Tensor, "B 1 H W"] = projected_tar_imgs.mean(1, keepdim=True) > 0.01
             out_img = projected_tar_imgs[0].cpu().numpy()
             warp_mask = rendered_masks[0, 0].cpu().numpy()
-            return out_img, warp_mask
+            warp_depth = projected_tar_depths[0, 0].cpu().numpy()
+            return out_img, warp_mask, warp_depth
             
         src_img = self.original_image # Torch tensor
         scaled_depth = self.depth # Torch tensor
@@ -211,40 +183,30 @@ class Camera(nn.Module):
         uid = (self.uid)
         # format .2f
         uid = self.uid
-        print(f'Warping {self.src_uid} to {uid: .2f}, dp min: {round(rendered_depth_min,5)}, dp max: {round(rendered_depth_max,5)}' )
-        # warped_img, warped_mask = depth_warping(src_img, scaled_depth, K, src_R, src_T, trg_R, trg_T, rendered_depth_min, rendered_depth_max)
-        warped_img, warped_mask = depth_warping_pt3d(src_img, scaled_depth, K, src_R, src_T, trg_R, trg_T)
+        print(f'Warping {self.src_uid} to {uid: .2f}' )
+        warped_img, warped_mask, warped_depth = depth_warping_pt3d(src_img, scaled_depth, K, src_R, src_T, trg_R, trg_T)
 
+        # dialte depth mask
+        edge_mask = edge_filter(warped_depth, valid_mask=warped_mask, times=0.1)
+        warped_depth[edge_mask] = 0.0
+        warped_mask = (warped_depth > 0.01) & warped_mask
+        
         warped_mask = warped_mask.astype(np.double)
         warped_img = torch.from_numpy(warped_img).to(torch.float32).to('cuda').detach()
         warped_mask = torch.from_numpy(warped_mask).to(torch.float32).to('cuda').detach()
+        warped_depth = torch.from_numpy(warped_depth).to(torch.float32).to('cuda').detach()
         self.original_image = warped_img
         self.warp_mask = warped_mask
-        
+        self.depth = warped_depth
         # import matplotlib.pyplot as plt
         # plt.figure()
         # plt.subplot(3,1,1)
-        # plt.imshow(src_img.clamp(0,1).detach().cpu().numpy().transpose(1,2,0))
+        # plt.imshow(warped_img.clamp(0,1).detach().cpu().numpy().transpose(1,2,0))
         # plt.subplot(3,1,2)
-        # plt.imshow(warped_img.detach().cpu().numpy().transpose(1,2,0))
+        # plt.imshow(warped_depth.detach().cpu().numpy())
         # plt.subplot(3,1,3)
         # plt.imshow(warped_mask.detach().cpu().numpy())
-        # plt.savefig(f"warp_{uid:.2f}.jpg", bbox_inches='tight')
+        # plt.savefig(f"warp_{uid:.2f}.png", bbox_inches='tight', dpi=1000)
         # plt.close()
 
-
-
-
-class MiniCam:
-    def __init__(self, width, height, fovy, fovx, znear, zfar, world_view_transform, full_proj_transform):
-        self.image_width = width
-        self.image_height = height    
-        self.FoVy = fovy
-        self.FoVx = fovx
-        self.znear = znear
-        self.zfar = zfar
-        self.world_view_transform = world_view_transform
-        self.full_proj_transform = full_proj_transform
-        view_inv = torch.inverse(self.world_view_transform)
-        self.camera_center = view_inv[3][:3]
 

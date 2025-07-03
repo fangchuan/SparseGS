@@ -80,10 +80,12 @@ class ModelParams(ParamGroup):
         self.SDS_freq = 0.1
 
         # Warp Reg parms
-        self.lambda_reg = 0.0
+        self.lambda_warp_reg = 0.0
         self.warp_reg_start_itr = 4999
         self.disable_filter3D = False
         self.kernel_size = 0.0 # Size of 2D filter in mip-splatting
+        
+        self.prune_min_opa = 0.1
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -121,6 +123,19 @@ class OptimizationParams(ParamGroup):
         self.densify_until_iter = 18_000
         self.densify_grad_threshold = 0.0002
         self.random_background = False
+        
+        self.pose_opt = True
+        # Learning rate for camera optimization
+        self.pose_opt_lr = 1e-5
+        self.pose_opt_lr_final = 1e-6
+        # Regularization for camera optimization as weight decay
+        self.pose_opt_reg = 1e-6
+        
+        # lpips loss
+        self.lpips_start_itr = 3000
+        
+        # depth/disparity loss
+        self.lambda_depth = 0.1
     
         super().__init__(parser, "Optimization Parameters")
 
