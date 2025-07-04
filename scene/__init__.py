@@ -114,7 +114,7 @@ class Scene:
                         if idx == 0 or idx == len(interp_cams_list) -1:
                             continue
                         novel_cam_append_list.append(create_cam_obj(cam=train_cams[0],
-                                                                    degree=idx,
+                                                                    new_uid=len(train_cam_list) + len(novel_cam_append_list),
                                                                     R=interp_cam.R,
                                                                     T=interp_cam.T,
                                                                     scaling_factor=args.resolution,

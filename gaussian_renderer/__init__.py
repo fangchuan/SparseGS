@@ -14,9 +14,18 @@ import math
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
+from scene.app_model import AppModel
 
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, kernel_size = 0.0, scaling_modifier = 1.0, require_coord : bool = True, require_depth : bool = True):
+def render(viewpoint_camera, 
+           pc : GaussianModel, 
+           pipe, 
+           bg_color : torch.Tensor, 
+           kernel_size = 0.0, 
+           scaling_modifier = 1.0, 
+           require_coord : bool = True, 
+           require_depth : bool = True,
+           app_model: AppModel = None):
     """
     Render the scene. 
     
@@ -82,7 +91,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
-    return {"render": rendered_image,
+    return_dict = {"render": rendered_image,
             "mask": rendered_alpha,
             "expected_coord": rendered_expected_coord,
             "median_coord": rendered_median_coord,
@@ -93,6 +102,12 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             "radii": radii,
             "normal":rendered_normal,
             }
+    if app_model is not None and pc.use_app:
+        appear_ab = app_model.appear_ab[torch.tensor(viewpoint_camera.uid).cuda()]
+        app_image = torch.exp(appear_ab[0]) * rendered_image + appear_ab[1]
+        return_dict.update({"app_image": app_image})   
+        
+    return return_dict
 
 # integration is adopted from GOF for marching tetrahedra https://github.com/autonomousvision/gaussian-opacity-fields/blob/main/gaussian_renderer/__init__.py
 def integrate(points3D, viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, kernel_size : float, scaling_modifier = 1.0, override_color = None):

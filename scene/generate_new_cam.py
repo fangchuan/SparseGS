@@ -129,7 +129,7 @@ def rotate_camera_poses(axis, rotation_matrices, translation_vectors, theta):
     new_translation_vectors = translation_vectors
     return new_rotation_matrices, new_translation_vectors
 
-def create_cam_obj(cam, degree, R, T, scaling_factor,cam_focal_dict):
+def create_cam_obj(cam, new_uid, R, T, scaling_factor,cam_focal_dict):
     src_img = cam.original_image.clone().detach() # Torch tensor
     scaled_depth = cam.depth.clone().detach() # Torch tensor
     src_R = cam.R
@@ -139,7 +139,8 @@ def create_cam_obj(cam, degree, R, T, scaling_factor,cam_focal_dict):
     [0, cam_focal_dict[cam.uid][1]/scaling_factor, (src_img.shape[1]-1) / 2],
     [0, 0, 1.0]
     ])).to('cuda')
-    uid = cam.uid + round(0.01*degree, 2)
+    # uid = cam.uid + round(0.01*degree, 2)
+    uid = new_uid
 
     return Camera(colmap_id= None, R=R, T=T, FoVx = cam.FoVx, FoVy = cam.FoVy,  
         image=src_img, depth=scaled_depth, K = K, src_R = src_R, src_T = src_T, src_uid = cam.uid,

@@ -21,7 +21,7 @@ from utils.image_utils import psnr
 from utils.graphics_utils import getWorld2View2
 from utils.typing import *
 from arguments import ModelParams, PipelineParams, OptimizationParams
-
+from scene.app_model import AppModel
 
 os.environ['QT_QPA_PLATFORM']='offscreen'
 try:
@@ -33,24 +33,53 @@ except ImportError:
 
 
 lpips_func = LearnedPerceptualImagePatchSimilarity(normalize=True).to('cuda')
-    
-# function L1_loss_appearance is fork from GOF https://github.com/autonomousvision/gaussian-opacity-fields/blob/main/train.py
-def L1_loss_appearance(image, gt_image, gaussians: GaussianModel, view_idx, return_transformed_image=False):
+
+def mask_L1_loss_appearance(image, gt_image, mask, gaussians: GaussianModel, view_idx, return_transformed_image=False):
     appearance_embedding = gaussians.get_apperance_embedding(view_idx)
     # center crop the image
     origH, origW = image.shape[1:]
-    H = origH // 32 * 32
-    W = origW // 32 * 32
+    downsample_scale = 8
+    H = origH // downsample_scale * downsample_scale
+    W = origW // downsample_scale * downsample_scale
     left = origW // 2 - W // 2
     top = origH // 2 - H // 2
     crop_image = image[:, top:top+H, left:left+W]
     crop_gt_image = gt_image[:, top:top+H, left:left+W]
     
     # down sample the image
-    crop_image_down = torch.nn.functional.interpolate(crop_image[None], size=(H//32, W//32), mode="bilinear", align_corners=True)[0]
+    crop_image_down = torch.nn.functional.interpolate(crop_image[None], size=(H//downsample_scale, W//downsample_scale), mode="bilinear", align_corners=True)[0]
     
-    crop_image_down = torch.cat([crop_image_down, appearance_embedding[None].repeat(H//32, W//32, 1).permute(2, 0, 1)], dim=0)[None]
+    resize_app_emb = appearance_embedding[None, None, :].repeat(H//downsample_scale, W//downsample_scale, 1).permute(2, 0, 1)
+    crop_image_down = torch.cat([crop_image_down, resize_app_emb], dim=0)[None]
     mapping_image = gaussians.appearance_network(crop_image_down)
+    # print(f"mapping image shape: {mapping_image.shape}, crop_image shape: {crop_image.shape}")
+    transformed_image = mapping_image * crop_image
+    if not return_transformed_image:
+        return mask_l1_loss(transformed_image, crop_gt_image, mask)
+    else:
+        transformed_image = torch.nn.functional.interpolate(transformed_image, size=(origH, origW), mode="bilinear", align_corners=True)[0]
+        return transformed_image
+        
+# function L1_loss_appearance is fork from GOF https://github.com/autonomousvision/gaussian-opacity-fields/blob/main/train.py
+def L1_loss_appearance(image, gt_image, gaussians: GaussianModel, view_idx, return_transformed_image=False):
+    appearance_embedding = gaussians.get_apperance_embedding(view_idx)
+    # center crop the image
+    origH, origW = image.shape[1:]
+    downsample_scale = 32
+    H = origH // downsample_scale * downsample_scale
+    W = origW // downsample_scale * downsample_scale
+    left = origW // 2 - W // 2
+    top = origH // 2 - H // 2
+    crop_image = image[:, top:top+H, left:left+W]
+    crop_gt_image = gt_image[:, top:top+H, left:left+W]
+    
+    # down sample the image
+    crop_image_down = torch.nn.functional.interpolate(crop_image[None], size=(H//downsample_scale, W//downsample_scale), mode="bilinear", align_corners=True)[0]
+    
+    resize_app_emb = appearance_embedding[None, None, :].repeat(H//downsample_scale, W//downsample_scale, 1).permute(2, 0, 1)
+    crop_image_down = torch.cat([crop_image_down, resize_app_emb], dim=0)[None]
+    mapping_image = gaussians.appearance_network(crop_image_down)
+    # print(f"mapping image shape: {mapping_image.shape}, crop_image shape: {crop_image.shape}")
     transformed_image = mapping_image * crop_image
     if not return_transformed_image:
         return l1_loss(transformed_image, crop_gt_image)
@@ -95,6 +124,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     warppedCameras: List[Camera] = scene.getFtCameras().copy()
     gaussians.ft_cameras_setup(opt, num_cams=len(trainCameras) + len(warppedCameras))
 
+    app_model = AppModel()
+    app_model.train()
+    app_model.cuda()
+    if checkpoint:
+        (model_params, first_iter) = torch.load(checkpoint)
+        gaussians.restore(model_params, opt)
+        app_model.load_weights(scene.model_path)
+        
     warp_cam_stack = None
     
     for iteration in range(first_iter, opt.iterations + 1):        
@@ -132,30 +169,34 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         viewpoint_idx = viewpoint_idxs.pop(rand)
 
         # optimize camera pose
-        if opt.pose_opt and viewpoint_idx != 0:
+        if opt.pose_opt and viewpoint_cam.uid != 0:
             # print(f"[INFO] Optimizing camera {viewpoint_cam.uid}")
             ori_worldtocam = torch.eye(4)
             ori_worldtocam[:3, :3] = torch.from_numpy(viewpoint_cam.R.T)
             ori_worldtocam[:3, 3] = torch.from_numpy(viewpoint_cam.T)
             ori_camtoworlds = torch.inverse(ori_worldtocam[None, ...]).to("cuda")
-            ft_camtoworlds = gaussians.pose_adjust(ori_camtoworlds, torch.tensor([viewpoint_idx], dtype=torch.long, device="cuda"))
+            ft_camtoworlds = gaussians.pose_adjust(ori_camtoworlds, torch.tensor([viewpoint_cam.uid], dtype=torch.long, device="cuda"))
             viewpoint_cam.update_view_transform(ft_camtoworlds[0])
 
+        exposure_compensation = True
+        if iteration > 1000 and exposure_compensation:
+            gaussians.use_app = True
         
         pick_warp_cam = ((randint(1, 10) <= 8) and (dataset.lambda_warp_reg > 0) and iteration > (dataset.warp_reg_start_itr))
         if pick_warp_cam: # A warping cam is picked
             if not warp_cam_stack:
                 warp_cam_stack = scene.getFtCameras().copy()
-            warp_cam: Camera = warp_cam_stack.pop(randint(0, len(warp_cam_stack)-1))
+            warp_cam_idx = randint(0, len(warp_cam_stack)-1)
+            warp_cam: Camera = warp_cam_stack.pop(warp_cam_idx)
             if opt.pose_opt:
                 # print(f"[INFO] Optimizing camera {warp_cam.uid}")
                 ori_worldtocam = torch.eye(4)
                 ori_worldtocam[:3, :3] = torch.from_numpy(warp_cam.R.T)
                 ori_worldtocam[:3, 3] = torch.from_numpy(warp_cam.T)
                 ori_camtoworlds = torch.inverse(ori_worldtocam[None, ...]).to("cuda")
-                ft_camtoworlds = gaussians.pose_adjust(ori_camtoworlds, torch.tensor([viewpoint_idx], dtype=torch.long, device="cuda"))
+                ft_camtoworlds = gaussians.pose_adjust(ori_camtoworlds, torch.tensor([warp_cam.uid], dtype=torch.long, device="cuda"))
                 warp_cam.update_view_transform(ft_camtoworlds[0])
-            warp_render_pkg = render(warp_cam, gaussians, pipe, background)
+            warp_render_pkg = render(warp_cam, gaussians, pipe, background, app_model=app_model)
             warpped_render_image, warp_viewspace_point_tensor, warp_visibility_filter, warp_radii, warp_render_depth = (
                                                                                                                     warp_render_pkg["render"], 
                                                                                                                     warp_render_pkg["viewspace_points"], 
@@ -170,7 +211,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if (iteration - 1) == debug_from:
             pipe.debug = True
         bg = torch.rand((3), device="cuda") if opt.random_background else background
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, kernel_size=0.0, require_coord=True, require_depth=True)
+        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, kernel_size=0.0, require_coord=True, require_depth=True, app_model=app_model)
         rendered_image: torch.Tensor
         rendered_image, viewspace_point_tensor, visibility_filter, radii, depth = (
                                                                     render_pkg["render"], 
@@ -179,7 +220,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                                                                     render_pkg["radii"],
                                                                     render_pkg["expected_depth"])
         gt_image = viewpoint_cam.original_image.cuda()
-        
         # if iteration == 1:
         #     # save rendered rgb annd depth
         #     import matplotlib.pyplot as plt
@@ -193,12 +233,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         #     plt.savefig(f"itr_{iteration}_{viewpoint_cam.uid:.2f}.png", bbox_inches='tight', dpi=1000)
         #     plt.close()
 
-        use_decoupled_appearance = True
-        if use_decoupled_appearance:
-            Ll1_render = L1_loss_appearance(rendered_image, gt_image, gaussians, viewpoint_cam.uid)
+        # use_decoupled_appearance = True
+        # if use_decoupled_appearance:
+        #     Ll1_render = L1_loss_appearance(rendered_image, gt_image, gaussians, viewpoint_cam.uid)
+        # else:
+        #     Ll1_render = l1_loss(rendered_image, gt_image)
+        ssim_loss = (1.0 - ssim(rendered_image, gt_image))
+        if 'app_image' in render_pkg and ssim_loss < 0.5:
+            app_image = render_pkg['app_image']
+            Ll1_render = l1_loss(app_image, gt_image)
         else:
             Ll1_render = l1_loss(rendered_image, gt_image)
-
+            
         reg_kick_on = iteration >= 30000
         if reg_kick_on:
             lambda_depth_normal = opt.lambda_depth_normal
@@ -227,7 +273,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             lambda_lpips = 0.0
             lpiploss = 0.0
-        rgb_loss = (1.0 - opt.lambda_dssim - lambda_lpips) * Ll1_render + opt.lambda_dssim * (1.0 - ssim(rendered_image, gt_image.unsqueeze(0))) + lambda_lpips * lpiploss
+        rgb_loss = (1.0 - opt.lambda_dssim - lambda_lpips) * Ll1_render + opt.lambda_dssim * (1.0 - ssim(rendered_image, gt_image)) + lambda_lpips * lpiploss
 
         loss = rgb_loss + lambda_depth_normal * depth_normal_loss
        
@@ -248,7 +294,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         #     loss += dataset.lambda_local_pearson * lp_loss
         
         if pick_warp_cam:
-            reg_Ll1 = mask_l1_loss(warpped_render_image, warpped_gt_image, warpped_mask)
+            ssim_loss = (1.0 - ssim(warpped_render_image, warpped_gt_image))
+            if 'app_image' in warp_render_pkg and ssim_loss < 0.5:
+                warp_app_image = warp_render_pkg['app_image']
+                reg_Ll1 = mask_l1_loss(warp_app_image, warpped_gt_image, warpped_mask)
+            else:
+                reg_Ll1 = mask_l1_loss(warpped_render_image, warpped_gt_image, warpped_mask)
+            # reg_Ll1 = mask_l1_loss(warpped_render_image, warpped_gt_image, warpped_mask)
+            
             reg_loss = (1.0 - opt.lambda_dssim) * reg_Ll1 + opt.lambda_dssim * (1.0 - ssim(warpped_render_image, warpped_gt_image))
             loss += dataset.lambda_warp_reg * reg_loss
             if opt.lambda_depth > 0:
@@ -258,6 +311,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 warp_depthloss = (F.l1_loss(warp_render_disp, warp_render_disp_gt, reduction="none") * warpped_mask * scene.cameras_extent).mean()
                 loss += opt.lambda_depth * warp_depthloss
 
+        # lambda_opacity_reg = 0.01
+        # if lambda_opacity_reg > 0:
+        #     opa_reg_loss = gaussians.get_opacity.mean()
+        #     print(f"opacity reg loss: {opa_reg_loss.item()}")
+        #     loss += lambda_opacity_reg * opa_reg_loss
+            
         loss.backward()
         iter_end.record()
 
@@ -333,12 +392,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gaussians.optimizer.zero_grad(set_to_none = True)
                 gaussians.pose_optimizer.step()
                 gaussians.pose_optimizer.zero_grad(set_to_none=True)
+                app_model.optimizer.step()
+                app_model.optimizer.zero_grad(set_to_none=True)
             
                 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
+    app_model.save_weights(scene.model_path, opt.iterations)
+    torch.cuda.empty_cache()
         
 def prepare_output_and_logger(args):    
     if not args.model_path:

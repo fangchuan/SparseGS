@@ -67,7 +67,8 @@ class GaussianModel:
         std = 1e-4
         self._appearance_embeddings = nn.Parameter(torch.empty(2048, 64).cuda())
         self._appearance_embeddings.data.normal_(0, std)
-
+        self.use_app = False
+        
     def capture(self):
         return (
             self.active_sh_degree,
