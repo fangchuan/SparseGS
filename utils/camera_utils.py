@@ -45,7 +45,8 @@ def loadCam(args, id, cam_info, resolution_scale):
     resized_depth = None
     if cam_info.depth is not None:
         resized_depth = NP_resize(cam_info.depth, resolution)
-        resized_depth = torch.Tensor((resized_depth - resized_depth.min())/(resized_depth.max() - resized_depth.min())).cuda()
+        # resized_depth = torch.Tensor((resized_depth - resized_depth.min())/(resized_depth.max() - resized_depth.min())).cuda()
+        resized_depth = torch.Tensor(resized_depth).cuda()
     # =============================================================================================================
 
     gt_image = resized_image_rgb[:3, ...]

@@ -390,7 +390,6 @@ def readSpatialgenCameras(data_dict: Dict[str, Any], load_depth: bool = True) ->
         init_scales = depth / focal_length_x / np.sqrt(2)
         init_scales = init_scales[:, :, None].repeat(3, axis=-1)
         scales = init_scales.reshape(-1, 3)
-        # print(f"scales shape: {scales.shape}, points shape: {input_point.shape}, colors shape: {input_color.shape}")
 
         uid = idx
         cam_info = SpatialGenCameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image, depth=depth,
