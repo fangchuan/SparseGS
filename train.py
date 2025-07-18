@@ -31,63 +31,7 @@ except ImportError:
     TENSORBOARD_FOUND = False
 
 
-
 lpips_func = LearnedPerceptualImagePatchSimilarity(normalize=True).to('cuda')
-
-def mask_L1_loss_appearance(image, gt_image, mask, gaussians: GaussianModel, view_idx, return_transformed_image=False):
-    appearance_embedding = gaussians.get_apperance_embedding(view_idx)
-    # center crop the image
-    origH, origW = image.shape[1:]
-    downsample_scale = 8
-    H = origH // downsample_scale * downsample_scale
-    W = origW // downsample_scale * downsample_scale
-    left = origW // 2 - W // 2
-    top = origH // 2 - H // 2
-    crop_image = image[:, top:top+H, left:left+W]
-    crop_gt_image = gt_image[:, top:top+H, left:left+W]
-    
-    # down sample the image
-    crop_image_down = torch.nn.functional.interpolate(crop_image[None], size=(H//downsample_scale, W//downsample_scale), mode="bilinear", align_corners=True)[0]
-    
-    resize_app_emb = appearance_embedding[None, None, :].repeat(H//downsample_scale, W//downsample_scale, 1).permute(2, 0, 1)
-    crop_image_down = torch.cat([crop_image_down, resize_app_emb], dim=0)[None]
-    mapping_image = gaussians.appearance_network(crop_image_down)
-    # print(f"mapping image shape: {mapping_image.shape}, crop_image shape: {crop_image.shape}")
-    transformed_image = mapping_image * crop_image
-    if not return_transformed_image:
-        return mask_l1_loss(transformed_image, crop_gt_image, mask)
-    else:
-        transformed_image = torch.nn.functional.interpolate(transformed_image, size=(origH, origW), mode="bilinear", align_corners=True)[0]
-        return transformed_image
-        
-# function L1_loss_appearance is fork from GOF https://github.com/autonomousvision/gaussian-opacity-fields/blob/main/train.py
-def L1_loss_appearance(image, gt_image, gaussians: GaussianModel, view_idx, return_transformed_image=False):
-    appearance_embedding = gaussians.get_apperance_embedding(view_idx)
-    # center crop the image
-    origH, origW = image.shape[1:]
-    downsample_scale = 32
-    H = origH // downsample_scale * downsample_scale
-    W = origW // downsample_scale * downsample_scale
-    left = origW // 2 - W // 2
-    top = origH // 2 - H // 2
-    crop_image = image[:, top:top+H, left:left+W]
-    crop_gt_image = gt_image[:, top:top+H, left:left+W]
-    
-    # down sample the image
-    crop_image_down = torch.nn.functional.interpolate(crop_image[None], size=(H//downsample_scale, W//downsample_scale), mode="bilinear", align_corners=True)[0]
-    
-    resize_app_emb = appearance_embedding[None, None, :].repeat(H//downsample_scale, W//downsample_scale, 1).permute(2, 0, 1)
-    crop_image_down = torch.cat([crop_image_down, resize_app_emb], dim=0)[None]
-    mapping_image = gaussians.appearance_network(crop_image_down)
-    # print(f"mapping image shape: {mapping_image.shape}, crop_image shape: {crop_image.shape}")
-    transformed_image = mapping_image * crop_image
-    if not return_transformed_image:
-        return l1_loss(transformed_image, crop_gt_image)
-    else:
-        transformed_image = torch.nn.functional.interpolate(transformed_image, size=(origH, origW), mode="bilinear", align_corners=True)[0]
-        return transformed_image
-
-    
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, step, max_cameras, prune_sched):
     first_iter = 0

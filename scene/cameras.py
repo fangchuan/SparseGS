@@ -187,9 +187,10 @@ class Camera(nn.Module):
         warped_img, warped_mask, warped_depth = depth_warping_pt3d(src_img, scaled_depth, K, src_R, src_T, trg_R, trg_T)
 
         # dialte depth mask
-        edge_mask = edge_filter(warped_depth, valid_mask=warped_mask, times=0.1)
-        warped_depth[edge_mask] = 0.0
-        warped_mask = (warped_depth > 0.01) & warped_mask
+        if warped_mask.mean() > 0.1:
+            edge_mask = edge_filter(warped_depth, valid_mask=warped_mask, times=0.1)
+            warped_depth[edge_mask] = 0.0
+            warped_mask = (warped_depth > 0.01) & warped_mask
         
         warped_mask = warped_mask.astype(np.double)
         warped_img = torch.from_numpy(warped_img).to(torch.float32).to('cuda').detach()
