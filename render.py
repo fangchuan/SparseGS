@@ -34,13 +34,11 @@ def render_set(model_path: str, name: str, iteration: int, views: List[Camera], 
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
     depth_path = os.path.join(model_path, name, "ours_{}".format(iteration), "depth")
-    modes_path = os.path.join(model_path, name, "ours_{}".format(iteration), "modes")
     expected_path = os.path.join(model_path, name, "ours_{}".format(iteration), "expected_depth")
 
     makedirs(render_path, exist_ok=True)
     makedirs(gts_path, exist_ok=True)
     makedirs(depth_path, exist_ok=True)
-    makedirs(modes_path, exist_ok=True)
     makedirs(expected_path, exist_ok=True)
 
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
@@ -49,25 +47,8 @@ def render_set(model_path: str, name: str, iteration: int, views: List[Camera], 
         rendering = results["render"]
 
         gt = view.original_image[0:3, :, :]
-        # depth = torch.exp(results["depth"] - results["depth"].min())
-        # alpha_depth = results["alpha_depth"]
-  
-        # depth = (depth-depth.min())/((depth.max()-depth.min()+ 1e-5))
-        # depth = torch.clip(depth.clone(), 0, 1).squeeze(0).detach().cpu().numpy()
-
-
-        # alpha_depth = results["alpha_depth"]
-        # alpha_depth = (alpha_depth-alpha_depth.min())/((alpha_depth.max()-alpha_depth.min()+ 1e-5))
-        # alpha_depth = torch.clip(alpha_depth.clone(), 0, 1).squeeze(0).detach().cpu().numpy()
-
-
-        # modes = normalize(results["modes"])
         torchvision.utils.save_image(rendering, os.path.join(render_path, view.image_name + ".png"))
         torchvision.utils.save_image(gt, os.path.join(gts_path, view.image_name + ".png"))
-
-        # plt.imsave(os.path.join(depth_path, view.image_name + ".png"), depth, cmap='jet')  
-
-        # cv2.imwrite(os.path.join(modes_path, view.image_name + ".png"), (modes.detach().cpu().numpy().squeeze() * 65535).astype(np.uint16))
 
     # render on interpolated trajectory
     rendered_rgbs, rendered_depths = [], []
@@ -89,15 +70,13 @@ def render_set(model_path: str, name: str, iteration: int, views: List[Camera], 
         alpha_depth = torch.clip(alpha_depth.clone(), 0, 1).squeeze().detach().cpu().numpy()
 
 
-        # torchvision.utils.save_image(rendering, os.path.join(render_path, view.image_name + ".png"))
+        torchvision.utils.save_image(rendering, os.path.join(render_path, view.image_name + ".png"))
         rendered_rgbs.append(((rendering.clamp(0., 1.).permute(1,2,0).detach().cpu().numpy()) * 255).astype(np.uint8))
 
         plt.imsave(os.path.join(depth_path, view.image_name + ".png"), depth, cmap='jet') 
         depth_image = np.array(Image.open(os.path.join(depth_path, view.image_name + ".png")))
         rendered_depths.append(depth_image) 
 
-        # modes = normalize(results["modes"])
-        # cv2.imwrite(os.path.join(modes_path, view.image_name + ".png"), (modes.detach().cpu().numpy().squeeze() * 65535).astype(np.uint16))
         
         plt.imsave(os.path.join(expected_path, view.image_name + ".png"), alpha_depth, cmap='jet')
         # rendered_depths.append(expected_depth_image)
